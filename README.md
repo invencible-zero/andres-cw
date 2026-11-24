@@ -20,6 +20,7 @@ In-memory H2 (`jdbc:h2:mem:andres_cw`), recreated on every start. Liquibase buil
 - Add a schema change: create `db/changelog/changes/NNN-description.yaml` and `include` it in the master file. Never edit a changeset that has already run; add a new one.
 - Applied changesets are recorded in the `DATABASECHANGELOG` table.
 - Datasource and Liquibase settings are in `application.properties`.
+- H2 web console: <http://localhost:8080/h2-console> (JDBC URL `jdbc:h2:mem:andres_cw`, user `sa`, empty password). It only works while the app is running, and it is limited to local access. Disable it (`spring.h2.console.enabled=false`) in any deployed environment.
 - Because H2 is in-memory, data is lost on restart. Swapping to a persistent database means changing `spring.datasource.*` and the driver dependency; the changelogs stay as they are.
 
 ## Build and test

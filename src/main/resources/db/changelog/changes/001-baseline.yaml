@@ -1,0 +1,10 @@
+# Baseline: creates no schema objects. It only tags the database so Liquibase
+# bootstraps its DATABASECHANGELOG / DATABASECHANGELOGLOCK tables and there is a
+# known starting point for later changesets.
+databaseChangeLog:
+  - changeSet:
+      id: 001-baseline
+      author: andres-cw
+      changes:
+        - tagDatabase:
+            tag: baseline

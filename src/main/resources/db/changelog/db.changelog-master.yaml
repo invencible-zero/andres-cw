@@ -1,0 +1,6 @@
+# Master changelog. Liquibase applies the files below in the order listed.
+# Add each new schema change as a new file under changes/ and include it here;
+# never edit a changeset that has already been applied somewhere (its checksum is recorded).
+databaseChangeLog:
+  - include:
+      file: db/changelog/changes/001-baseline.yaml

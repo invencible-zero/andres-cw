@@ -24,18 +24,20 @@ The problem is broken down using **Domain-Driven Design (DDD)**, which consists 
 
 ## 2. Domains
 
-Relationships between the domains (context map):
+The context diagram is in [Caseware - Context Diagram](../diagrams/Caseware%20-%20Context%20Diagram.drawio). Relationships between the domains (context map):
 
-- **Product → Integration → Engagement:** Product is the upstream publisher. Engagement is a downstream consumer that conforms to the published event contract.
+- **Product → Integration → Engagement:** Product is the upstream publisher. Engagement is a downstream consumer that conforms to the published event contract, and it reads versions, diffs and summaries through the Product Engine API, never its database (Appendix A).
 - **User → Product, Engagement:** User is an upstream service that both engines call for access decisions.
 - **Financial System:** external to all domains. The Engagement Engine reaches it through an anti-corruption layer so that its model does not leak into ours.
+- **Amazon Bedrock:** an external managed service used by the Product Engine to write the summaries. It receives template diffs only, never engagement data.
 
 ### 2.1 Product Domain
 
-This domain consists of two components:
+This domain consists of three components:
 
 - **Product Engine** microservice(s)
 - **Product/Template Database** (DynamoDB global table, replicated to every region)
+- **Summary Store** (Amazon S3 with Object Lock): the immutable, versioned summaries with their provenance (section 4)
 
 The domain is managed by the owner of the products and templates (Caseware content teams), who create products, publish new template versions and withdraw versions when needed. Its database is the common source of truth for product and template metadata, including the version graph (parents, market, status). It holds no information about engagement files.
 
@@ -53,15 +55,15 @@ The Product Engine can be implemented as a microservice(s) cluster, which offers
 
 This is the customer-facing application. It creates new engagement files from the latest available template version, loads them with up-to-date external financial information, records apply/decline decisions and shows which files have pending updates.
 
-It is made up of five components, four internal and one external:
+It is made up of four internal components and one external dependency, the Financial System, which the diagram draws outside the domain (the diagram also draws the Update Fan-out Worker and the Update Index as boxes of their own):
 
 - **Engagement Engine** microservice(s) cluster, including the **Update Fan-out Worker** that processes publish events and the backfill (section 5).
 - **Engagement Database:** the customer-specific engagement stores plus the **Update Index**.
-- **Storage System:** stores engagement files in one or multiple regions on demand.
+- **Storage System:** stores engagement files in the firm's region (one in-region bucket and key set per regional cell).
 - **Cache:** holds immutable, frequently read artifacts (template archives by version, diffs, summaries). It never caches volatile financial fields.
 - **Financial System** (external): provides the volatile financial fields.
 
-The **Update Index** holds, per region and per engagement file, the firm, product, template, baseline version, verification state, the append-only decisions and the derived pending updates. It is stored in regional DynamoDB tables, deliberately not in global tables, because it references firm data and must not replicate across regions. The engagement file remains the source of truth for its baseline. The index is derived data: hooks on creation, load, apply and decline update it, and it self-heals every time a file is loaded.
+The **Update Index** holds, per region and per engagement file, the firm, product, template, baseline version, verification state, the append-only decisions and the derived pending updates. It is stored in regional DynamoDB tables, deliberately not in global tables, because it references engagement files and must not replicate across regions. The engagement file remains the source of truth for its baseline. The index is derived data: hooks on creation, load, apply and decline update it, and it self-heals every time a file is loaded.
 
 An API overview is in Appendix A.
 
@@ -69,14 +71,14 @@ An API overview is in Appendix A.
 
 This layer is responsible for the asynchronous communication channel between domains. For this business case, publishing a template version to many firms requires a publish-subscribe approach: the Product Engine acts as the publisher and each regional Engagement Engine acts as a consumer. This asynchronous design distributes new template versions efficiently, and every consumer applies or declines the new version at its own pace.
 
-- **Technology:** Apache Kafka (Amazon MSK). One topic for template lifecycle events, keyed by template id so that events for the same template stay ordered. Each region consumes in its own consumer group.
+- **Technology:** Apache Kafka (Amazon MSK), one cluster per region, fed from the primary region by MSK Replicator. One topic for template lifecycle events, keyed by template id so that events for the same template stay ordered. Each region consumes in its own consumer group.
 - **Event contract:** `{eventId, type, productId, templateId, version, parents, market, lineageRevision, occurredAt}`. Events carry identifiers, not content.
 - **Delivery:** at-least-once, with a retention of at least 7 days for replay and a dead-letter queue for poison messages.
-- The events contain no firm data, so they can cross regions.
+- The events contain no engagement data, so they can cross regions.
 
 ### 2.4 User Domain
 
-Through this domain, user management is carried out. Both the Product Engine and the Engagement Engine request the access grant per user for their internal functions.
+Through this domain, user management is carried out. Both the Product Engine and the Engagement Engine request the access grant per user for their internal functions. It consists of two components: **User Management** (Amazon Cognito, one user pool per region) and the **User Directory** (a DynamoDB global table with the entitlements and the firm-to-region residency map, which contain no engagement data).
 
 Responsibilities:
 
@@ -125,7 +127,7 @@ Responsibilities:
 | Backfill | 800,000 × 1 min | 13,333 loader-hours: 5.6 days at 100 concurrent, 2.8 days at 200 |
 | Reconciliation | 1% sample per week = 8,000 loads | 133 loader-hours, ~0.8 concurrent loads over the week |
 | Index size | 800,000 × ~1 KB + ~1.6 M pending rows × ~0.2 KB | ~1.1 GB, stored in regional DynamoDB tables (on-demand) |
-| Summaries | ~170 publishes × ≤ 5 distinct baselines × ≤ $0.25 | ~850 summaries, ≤ ~$210/month |
+| Summaries | ~170 publishes × ≤ 5 distinct baselines × ≤ $0.25 | ~850 summaries, ≤ ~$213/month |
 
 **Cost.** Inference scales with the number of distinct version pairs (hundreds per month), not with the 800,000 engagement files, and there are no loads on the publish path. The recurring cost is therefore dominated by fixed, highly available infrastructure. The one-time backfill cost (13,333 loader-hours) falls mostly on the team that owns the load operation, so its cap and schedule must be agreed with them.
 
@@ -153,7 +155,7 @@ Responsibilities:
 
 - *Kafka is the largest line:* MSK plus Replicator is ≈ $1,950 (44%) for ~40 events per week. Replacing it with SNS plus SQS (cross-region subscriptions) would lower the total to ≈ $2,490.
 - *Cognito is the line that grows most with users:* each additional 10,000 monthly active users adds $150.
-- *DynamoDB is almost free at this data size.* Global tables are used only where the data is not firm-specific (catalog, user directory). The Update Index uses regional tables because it holds firm data.
+- *DynamoDB is almost free at this data size.* Global tables are used only where the data contains no engagement data (catalog, user directory). The Update Index uses regional tables because it references engagement files.
 - *Not included:* internet data transfer to users, WAF and Shield, the support plan, taxes and the one-time backfill compute.
 
 **Fan-out worker (Part 2).** On `TemplateVersionPublished`, the worker recomputes the affected rows from the index. For files in `UNKNOWN` state it enqueues a low-priority load task, which is the same path the backfill uses.
@@ -200,10 +202,10 @@ Dashboards per region, traces keyed by `eventId`, alerts on lag, dead-letter dep
 ## 7. Data residency
 
 - **Regional cells** (EU, Canada, default) contain the Engagement Engine, Engagement Database and Update Index, Storage (in-region bucket and KMS keys), Cache, consumers and the audit store. Engagement content, decisions and logs never leave the region.
-- **Global:** the Product Domain (a DynamoDB global table), the summaries and the Kafka events contain no firm data and are replicated to the regions (global table replication, S3 replication, MSK Replicator).
-- **Identity:** one Cognito user pool per region, without multi-region replication, so user identities stay in their firm's region. Only the firm-to-region map (a global table) is replicated, and it routes each login to the right pool.
+- **Global:** the Product Domain (a DynamoDB global table), the summaries and the Kafka events contain no engagement data and are replicated to the regions (global table replication, S3 replication, MSK Replicator).
+- **Identity:** one Cognito user pool per region, without multi-region replication, so user identities stay in their firm's region. Only the User Directory (entitlements and the firm-to-region map, a global table with no engagement data) is replicated, and it routes each login to the right pool.
 - **LLM:** the model only sees template diffs, so no client-confidential data reaches the inference provider and one global summarization is compliant.
-- **Routing:** the User Domain maps each firm to its region and the edge routes requests to that cell. The only cross-region data is template identifiers and versions.
+- **Routing:** the User Domain maps each firm to its region and the edge routes requests to that cell. The only cross-region data is the replicated Product Domain data, summaries, version events and User Directory, none of which contains engagement data.
 
 ## 8. Trade-offs, risks and scope
 

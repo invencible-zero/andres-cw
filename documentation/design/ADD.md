@@ -266,3 +266,19 @@ Dashboards per region, traces keyed by `eventId`, alerts on lag, dead-letter dep
 | `POST /login` | public | Allow the sign-on to the system and issue a token (the only public API) |
 | `GET /me/permissions` | private | Permissions and entitlements of the caller |
 | `GET /firms/{firmId}/residency` | internal | Region assigned to a firm |
+
+
+## Appendix B. Diagrams
+
+### B.1 Context diagram
+
+Domains, components, external systems and the regional cells (section 2).
+
+![Context diagram: domains, components and external systems](../diagrams/Caseware%20-%20Context%20Diagram.png)
+
+### B.2 Data model
+
+Logical data model, grouped by domain (sections 2 and 3). Relationships that cross domains are logical references, not enforced constraints, because domains never share a database. `pending_update` is derived data (the Update Index).
+
+![Data model: product, engagement and user domains](../diagrams/cw-data-model.png)
+

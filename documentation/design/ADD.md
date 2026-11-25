@@ -35,19 +35,19 @@ Relationships between the domains (context map):
 This domain consists of two components:
 
 - **Product Engine** microservice(s)
-- **Product/Template Database** (relational)
+- **Product/Template Database** (DynamoDB global table, replicated to every region)
 
 The domain is managed by the owner of the products and templates (Caseware content teams), who create products, publish new template versions and withdraw versions when needed. Its database is the common source of truth for product and template metadata, including the version graph (parents, market, status). It holds no information about engagement files.
 
 Responsibilities:
 
 - Publish immutable template versions and record their lineage. A published version is never edited or deleted, only withdrawn.
-- In the same database transaction that stores a new version, write an outbox record. A relay then publishes `TemplateVersionPublished` (or `TemplateVersionWithdrawn`) to the Integration Domain, so a version is never stored without its event.
+- In the same transaction that stores a new version (DynamoDB `TransactWriteItems`), write an outbox item. A relay, running as a module of the Product Engine and reading the table's change stream, then publishes `TemplateVersionPublished` (or `TemplateVersionWithdrawn`) to the Integration Domain, so a version is never stored without its event.
 - Produce the diff and the human-readable summary between two versions (section 4), as an asynchronous module of the Product Engine.
 - Retrieve fine-grained permissions from the User Domain to gate user access. Internal content users can write; firm users can only read.
-- Be the only entry point to template data. Other domains use its APIs and events, never its database. Today, engagement creation reads the database directly; that read is moved behind the API during migration.
+- Be the only entry point to template data. Other domains use its APIs and events, never its database. 
 
-The Product Engine can be implemented as a microservice, which offers horizontal scalability for high-traffic periods. An API overview is in Appendix A.
+The Product Engine can be implemented as a microservice(s) cluster, which offers horizontal scalability for high-traffic periods. An API overview is in Appendix A.
 
 ### 2.2 Engagement Domain
 
@@ -55,13 +55,13 @@ This is the customer-facing application. It creates new engagement files from th
 
 It is made up of five components, four internal and one external:
 
-- **Engagement Engine** microservice(s), including the **Update Fan-out Worker** that processes publish events and the backfill (section 5).
+- **Engagement Engine** microservice(s) cluster, including the **Update Fan-out Worker** that processes publish events and the backfill (section 5).
 - **Engagement Database:** the customer-specific engagement stores plus the **Update Index**.
 - **Storage System:** stores engagement files in one or multiple regions on demand.
 - **Cache:** holds immutable, frequently read artifacts (template archives by version, diffs, summaries). It never caches volatile financial fields.
 - **Financial System** (external): provides the volatile financial fields.
 
-The **Update Index** holds, per region and per engagement file, the firm, product, template, baseline version, verification state, the append-only decisions and the derived pending updates. The engagement file remains the source of truth for its baseline. The index is derived data: hooks on creation, load, apply and decline update it, and it self-heals every time a file is loaded.
+The **Update Index** holds, per region and per engagement file, the firm, product, template, baseline version, verification state, the append-only decisions and the derived pending updates. It is stored in regional DynamoDB tables, deliberately not in global tables, because it references firm data and must not replicate across regions. The engagement file remains the source of truth for its baseline. The index is derived data: hooks on creation, load, apply and decline update it, and it self-heals every time a file is loaded.
 
 An API overview is in Appendix A.
 
@@ -80,7 +80,7 @@ Through this domain, user management is carried out. Both the Product Engine and
 
 Responsibilities:
 
-- Authentication (a single `/login` for all domains) and token issuance. Engines validate signed tokens locally, so there is no synchronous call on the hot path.
+- Authentication (a single `/login` for all domains, implemented with Amazon Cognito and one user pool per region) and token issuance. Engines validate signed tokens locally, so there is no synchronous call on the hot path.
 - RBAC schema and entitlements (which products and markets a firm can use). Permission decisions are cached with a short TTL and fail closed.
 - Residency policy: the source of truth for which region each firm belongs to. The User Domain declares the region; the Engagement Domain enforces it (section 7).
 
@@ -89,7 +89,7 @@ Responsibilities:
 - **Version graph.** Each template version has zero or more parents, a market and a status (published or withdrawn). v7 *contains* v5 when v5 is an ancestor of v7.
 - **Pending updates.** For an engagement file with baseline *b*, the pending updates are the versions *v* that are published, descend from *b*, have not been declined for that file and are not an ancestor of another candidate. Accumulated updates therefore collapse into the latest candidate per branch, and the user makes one decision instead of several.
 - **Cumulative summary.** The summary always compares the baseline with the candidate, never the previous update. If v5 was declined and v7 contains it, v7 is offered again, and its summary states "includes changes from v5, declined on *date*". The intermediate steps remain viewable.
-- **What "declined" pins.** A decline is an immutable record about one engagement file and one target version: who, when and which summary was shown. It leaves the baseline unchanged and does not block later versions, including those that contain the declined changes. It does not mean "never ask again".
+- **What "declined" means.** A decline is an immutable record about one engagement file and one target version: who, when and which summary was shown. It leaves the baseline unchanged and does not block later versions, including those that contain the declined changes. It does not mean "never ask again".
 - **Withdrawal.** Because pending updates are derived, withdrawing v7 removes it from the lists and re-exposes v6 if v7 was hiding it. Firms that already applied a withdrawn version are flagged to the content team.
 - **Idempotent recompute.** On each event the consumer reads the current version graph and recomputes the affected rows instead of applying a delta. Duplicates, delays and reordering converge. Decisions are append-only.
 - **Honest indicator.** Each engagement file shows one of three states: `UP_TO_DATE`, `UPDATES_PENDING (n)` or `UNKNOWN` (not yet indexed or not verified). The system never shows "up to date" for a file it has not verified.
@@ -124,10 +124,37 @@ Responsibilities:
 | Largest firm | 40,000 files | ~2 s of index updates vs. 667 h of loads |
 | Backfill | 800,000 × 1 min | 13,333 loader-hours: 5.6 days at 100 concurrent, 2.8 days at 200 |
 | Reconciliation | 1% sample per week = 8,000 loads | 133 loader-hours, ~0.8 concurrent loads over the week |
-| Index size | 800,000 × ~1 KB + ~1.6 M pending rows × ~0.2 KB | ~1.1 GB, a small managed relational instance per region |
+| Index size | 800,000 × ~1 KB + ~1.6 M pending rows × ~0.2 KB | ~1.1 GB, stored in regional DynamoDB tables (on-demand) |
 | Summaries | ~170 publishes × ≤ 5 distinct baselines × ≤ $0.25 | ~850 summaries, ≤ ~$210/month |
 
-**Cost.** Inference scales with the number of distinct version pairs (hundreds per month), not with the 800,000 engagement files, and there are no loads on the publish path. The recurring cost is dominated by fixed infrastructure (three regional cells and Kafka), sized small. I cannot show the total against *$X* without the budget. The one-time backfill cost falls mostly on the team that owns the load operation, so its cap and schedule must be agreed with them.
+**Cost.** Inference scales with the number of distinct version pairs (hundreds per month), not with the 800,000 engagement files, and there are no loads on the publish path. The recurring cost is therefore dominated by fixed, highly available infrastructure. The one-time backfill cost (13,333 loader-hours) falls mostly on the team that owns the load operation, so its cap and schedule must be agreed with them.
+
+**Monthly cost estimate.** The estimate uses AWS on-demand list prices (November 2026) in three regions: us-east-1 (default and primary), eu-west-1 (EU) and ca-central-1 (Canada). It assumes 730 hours per month, 60,000 monthly active users (4,000 firms × ~15 users), ~18 M API requests per month (~300 per user) and a 50/30/20 split of firms across the default, EU and Canada regions. Every service runs in at least two availability zones. Only this feature is counted: the existing engagement stores and the pods that load engagement files are excluded.
+
+| Component | Sizing | USD/month |
+| -- | -- | -- |
+| ECS Fargate: Product Engine | 8 tasks of 1 vCPU / 2 GB: API ×2 in each region, plus the worker (outbox relay, summaries) ×2 in the primary region (pilot light elsewhere, not costed) | 296 |
+| ECS Fargate: Engagement Engine | 12 tasks of 1 vCPU / 2 GB: API ×2 and fan-out worker ×2 in each region | 447 |
+| Application Load Balancers | 6 internal (one per engine per region), multi-AZ | 142 |
+| API Gateway (HTTP API) | ~18 M requests, regional, JWT authorizer with Cognito | 19 |
+| Cognito (Essentials) | 60,000 MAU minus the 10,000 free; one user pool per region, no multi-region replication (residency) | 750 |
+| DynamoDB global tables | Catalog (products, templates, version graph, outbox) and user directory (entitlements, firm-to-region map), 3 replicas, on-demand, PITR | 8 |
+| DynamoDB regional tables | Update Index and decisions (~1.1 GB in total), on-demand, PITR | 9 |
+| ElastiCache (Valkey) | cache.t4g.medium, primary + replica in 2 AZs, in each region | 237 |
+| MSK (Kafka) | 3 × kafka.m7g.large in 3 AZs in each region, 50 GB per broker | 1,491 |
+| MSK Replicator | Primary → EU and primary → Canada | 460 |
+| NAT gateways | 2 per region, 100 GB processed per region | 223 |
+| Bedrock inference | ~850 summaries × ≤ $0.25 | 213 |
+| CloudWatch | 150 GB of logs, ~60 custom metrics, 50 alarms, 3 dashboards | 112 |
+| S3, KMS, Route 53, inter-region transfer | < 200 GB of artifacts, 6 KMS keys, 6 health checks | 26 |
+| **Total** | | **≈ 4,433** |
+
+**The design as drawn costs ≈ $4,430 per month.**
+
+- *Kafka is the largest line:* MSK plus Replicator is ≈ $1,950 (44%) for ~40 events per week. Replacing it with SNS plus SQS (cross-region subscriptions) would lower the total to ≈ $2,490.
+- *Cognito is the line that grows most with users:* each additional 10,000 monthly active users adds $150.
+- *DynamoDB is almost free at this data size.* Global tables are used only where the data is not firm-specific (catalog, user directory). The Update Index uses regional tables because it holds firm data.
+- *Not included:* internet data transfer to users, WAF and Shield, the support plan, taxes and the one-time backfill compute.
 
 **Fan-out worker (Part 2).** On `TemplateVersionPublished`, the worker recomputes the affected rows from the index. For files in `UNKNOWN` state it enqueues a low-priority load task, which is the same path the backfill uses.
 
@@ -152,7 +179,7 @@ Dashboards per region, traces keyed by `eventId`, alerts on lag, dead-letter dep
 
 **Rollout without a maintenance window** (every step is additive and reversible):
 
-1. *Product:* add lineage (parents, status) and the outbox as nullable columns. Parents for historical versions are backfilled (linear history assumed unless the content team provides the branches). The existing publish path is unchanged.
+1. *Product:* add lineage (parents, status) and the outbox as new, optional attributes. Parents for historical versions are backfilled (linear history assumed unless the content team provides the branches). The existing publish path is unchanged.
 2. *Engagement:* add asynchronous hooks (create, load, apply, decline). A hook failure never fails a user operation. The Update Index runs in shadow mode, invisible to users.
 3. *Backfill:* existing files are indexed by the fan-out worker, rate-limited, resumable (per-firm cursor) and idempotent. Any file a user opens is indexed immediately, so the most-used files come first.
 4. *Validate:* reconcile a sample of loads against the index until the accuracy SLO is met.
@@ -173,7 +200,8 @@ Dashboards per region, traces keyed by `eventId`, alerts on lag, dead-letter dep
 ## 7. Data residency
 
 - **Regional cells** (EU, Canada, default) contain the Engagement Engine, Engagement Database and Update Index, Storage (in-region bucket and KMS keys), Cache, consumers and the audit store. Engagement content, decisions and logs never leave the region.
-- **Global:** the Product Domain, the summaries and the Kafka events contain no firm data and are replicated to the regions (MSK Replicator or equivalent).
+- **Global:** the Product Domain (a DynamoDB global table), the summaries and the Kafka events contain no firm data and are replicated to the regions (global table replication, S3 replication, MSK Replicator).
+- **Identity:** one Cognito user pool per region, without multi-region replication, so user identities stay in their firm's region. Only the firm-to-region map (a global table) is replicated, and it routes each login to the right pool.
 - **LLM:** the model only sees template diffs, so no client-confidential data reaches the inference provider and one global summarization is compliant.
 - **Routing:** the User Domain maps each firm to its region and the edge routes requests to that cell. The only cross-region data is template identifiers and versions.
 
@@ -184,13 +212,11 @@ Dashboards per region, traces keyed by `eventId`, alerts on lag, dead-letter dep
 - *Update Index vs. loading for the truth:* the index is eventually consistent. Bounded staleness (SLO) and a reconciliation cost are accepted in exchange for seconds instead of hundreds of hours.
 - *Materialized pending rows vs. computing on read:* materialized, for fast counts and filters.
 - *One global summary vs. one per firm:* global is cheaper, consistent and auditable. It cannot be personalized per engagement, which is acceptable because applying content is out of scope.
-- *Kafka vs. SNS/SQS:* Kafka gives per-key ordering, replay and one consumer group per region, but ~40 events per week is far below what it is built for. SNS plus SQS would be enough, so this should be revisited if the operating cost outweighs the benefit.
+- *Kafka vs. SNS/SQS:* Kafka gives per-key ordering, replay and one consumer group per region, but ~40 events per week is far below what it is built for, and it is the largest line in the cost estimate (≈ $1,950 of ≈ $4,430 per month). SNS plus SQS would be enough, so this should be revisited if the operating cost outweighs the benefit.
 
-**Requirement I would challenge: "real time, within seconds of publication".** Publishes are weekly per product and firms decide over days, so seconds versus one minute has no business value. A strict seconds target would also push unvalidated model output to users, which conflicts with defensibility. The design meets seconds for the indicator in the typical case, and I propose defining "real time" as p99 < 60 s for the indicator and p95 < 5 min for the validated summary.
 
 **Riskiest part: the correctness of baselines and lineage.** A false "up to date" is silent, and the source data is the least known today (parents of historical versions, baselines of existing files). Mitigations: the `UNKNOWN` state, self-healing on load, sampled reconciliation with an accuracy SLO, and per-firm enablement only at 100% coverage. The second risk is a summary that omits or invents a change, which is mitigated by validation and the deterministic fallback.
 
-**Deliberately left out:** applying template content; notifications (email, push); remediation for firms that applied a later-withdrawn version; moving a firm between regions; per-engagement impact analysis (it would require loading engagement content); localization of summaries; disaster-recovery targets (RPO/RTO); UI design; identity-provider details.
 
 ## 9. Assumptions
 
@@ -201,7 +227,7 @@ Dashboards per region, traces keyed by `eventId`, alerts on lag, dead-letter dep
 - The diff tool is deterministic for a given version pair.
 - Engagement file identifiers contain no client content, so they can be used in cross-region metadata.
 - The content team can provide or confirm the parents and market of historical template versions.
-- The budget *$X* is not known; the cost analysis shows what scales and what does not.
+- Cost figures use AWS on-demand list prices (November 2026), 60,000 monthly active users (4,000 firms × ~15) and a 50/30/20 split of firms across the default, EU and Canada regions.
 
 ## Appendix A. API overview
 
